@@ -22,16 +22,21 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deactivate = exports.activate = void 0;
 const vscode = __importStar(require("vscode"));
+const acorn = __importStar(require("acorn"));
+const acorn_walk_1 = require("acorn-walk");
 const vscode_1 = require("vscode");
 const child_process_1 = require("child_process");
 const util_1 = require("util");
+const php_parser_1 = __importDefault(require("php-parser"));
 const diagnosticCollection = vscode.languages.createDiagnosticCollection('code-duplication');
 const execPromise = (0, util_1.promisify)(child_process_1.exec);
 function activate(context) {
-    // Register a command to check for duplicates
     let checkDuplicates = vscode.commands.registerCommand('extension.checkDuplicates', async () => {
         const activeEditor = vscode.window.activeTextEditor;
         if (!activeEditor) {
@@ -39,58 +44,128 @@ function activate(context) {
             return;
         }
         const document = activeEditor.document;
+        const diagnostics = [];
         try {
-            // Extract all functions from the document
             const functions = extractFunctions(document);
-            // Find duplicate functions
-            const duplicates = findDuplicateFunctions(functions);
-            // Create diagnostics for duplicates
-            const diagnostics = [];
-            duplicates.forEach((dup) => {
+            const functionDuplicates = findDuplicateFunctions(functions);
+            const codeDuplicates = findNextCodeDuplicate(document);
+            const ifStatements = extractIfStatements(document);
+            const ifDuplicates = findDuplicateIfStatements(ifStatements);
+            // Create diagnostics for function duplicates
+            functionDuplicates.forEach((dup) => {
                 diagnostics.push(new vscode_1.Diagnostic(dup.range, `Duplicate function found. Similar function '${dup.matchName}' exists at line ${dup.matchRange.start.line + 1}`, vscode.DiagnosticSeverity.Warning));
             });
-            // Show diagnostics
+            // Create diagnostics for code block duplicates
+            codeDuplicates.forEach((dup) => {
+                diagnostics.push(new vscode_1.Diagnostic(dup.range, `Duplicate code found. Similar code exists at line ${dup.matchRange.start.line + 1}`, vscode.DiagnosticSeverity.Warning));
+            });
+            // Create diagnostics for if statement duplicates
+            ifDuplicates.forEach((dup) => {
+                diagnostics.push(new vscode_1.Diagnostic(dup.range, `Duplicate if statement found. Similar if statement exists at line ${dup.matchRange.start.line + 1}`, vscode.DiagnosticSeverity.Warning));
+            });
+            // Set diagnostics
             diagnosticCollection.set(document.uri, diagnostics);
-            // Handle duplicate functions if found
-            if (duplicates.length > 0) {
-                // Start the interactive process to review each duplicate
-                await reviewDuplicateFunctions(duplicates, document);
+            const originalText = document.getText();
+            if (functionDuplicates.length || codeDuplicates.length || ifDuplicates.length) {
+                const choices = [];
+                if (functionDuplicates.length)
+                    choices.push('Functions');
+                if (codeDuplicates.length)
+                    choices.push('Code');
+                if (ifDuplicates.length)
+                    choices.push('If Statements');
+                choices.push('All', 'Skip');
+                const choice = await vscode.window.showQuickPick(choices, {
+                    placeHolder: 'Duplicate content found. What would you like to review?'
+                });
+                if (!choice || choice === 'Skip')
+                    return;
+                // Clone document text to reset after each pass if needed
+                let updatedText = originalText;
+                // Helper to refresh document state
+                const refreshDocumentState = () => {
+                    const edit = new vscode.WorkspaceEdit();
+                    const fullRange = new vscode_1.Range(document.positionAt(0), document.positionAt(document.getText().length));
+                    edit.replace(document.uri, fullRange, updatedText);
+                    return vscode.workspace.applyEdit(edit);
+                };
+                const cleanupStates = async () => {
+                    var _a;
+                    try {
+                        // Save the document first
+                        await ((_a = vscode.window.activeTextEditor) === null || _a === void 0 ? void 0 : _a.document.save());
+                        // Clear all temporary variables
+                        updatedText = '';
+                        clearHighlights();
+                        diagnosticCollection.clear();
+                        // Close any open diff panel
+                        if (diffPanel) {
+                            diffPanel.dispose();
+                            diffPanel = undefined;
+                        }
+                        // Clear processed duplicates for the current type
+                        clearProcessedDuplicates();
+                        // Reload the document to ensure we have the latest content
+                        const doc = await vscode.workspace.openTextDocument(document.uri);
+                        await vscode.window.showTextDocument(doc);
+                    }
+                    catch (error) {
+                        console.error('Error during cleanup:', error);
+                        throw error;
+                    }
+                };
+                const reviewAndRefresh = async (reviewFn, findFn, type) => {
+                    try {
+                        // Clear previously processed duplicates for this type
+                        clearProcessedDuplicates(type);
+                        const reloadedText = document.getText();
+                        const newItems = findFn(reloadedText);
+                        if (newItems.length > 0) {
+                            // Mark all items as processed for this type
+                            newItems.forEach((item) => {
+                                if (item.range && item.matchRange) {
+                                    processedDuplicates.push({
+                                        start: item.range.start.line,
+                                        end: item.range.end.line,
+                                        matchStart: item.matchRange.start.line,
+                                        matchEnd: item.matchRange.end.line,
+                                        type: type
+                                    });
+                                }
+                            });
+                            await reviewFn(newItems, document);
+                            updatedText = document.getText(); // capture post-edit
+                            await refreshDocumentState(); // reload and re-analyze
+                        }
+                        return true;
+                    }
+                    catch (error) {
+                        console.error(`Error during ${type} review:`, error);
+                        return false;
+                    }
+                };
+                try {
+                    let success = true;
+                    if (choice === 'Functions' || choice === 'All') {
+                        success = await reviewAndRefresh(reviewDuplicateFunctions, () => findDuplicateFunctions(extractFunctions(document)), 'functions');
+                    }
+                    if (success && (choice === 'Code' || choice === 'All')) {
+                        success = await reviewAndRefresh(reviewDuplicateCode, () => findNextCodeDuplicate(document), 'code');
+                    }
+                    if (success && (choice === 'If Statements' || choice === 'All')) {
+                        success = await reviewAndRefresh(reviewDuplicateIfStatements, () => findDuplicateIfStatements(extractIfStatements(document)), 'if_statements');
+                    }
+                    // Final cleanup regardless of success/failure
+                    await cleanupStates();
+                }
+                catch (error) {
+                    console.error('Error during review process:', error);
+                    await cleanupStates();
+                    throw error;
+                }
             }
             else {
-                // Now check for the first code duplicate if no function duplicates were found
-                const codeDuplicates = findNextCodeDuplicate(document);
-                if (codeDuplicates.length > 0) {
-                    // Add diagnostics for the first code duplicate
-                    codeDuplicates.forEach((dup) => {
-                        diagnostics.push(new vscode_1.Diagnostic(dup.range, `Duplicate code found. Similar code exists at line ${dup.matchRange.start.line + 1}`, vscode.DiagnosticSeverity.Warning));
-                    });
-                    // Update diagnostics
-                    diagnosticCollection.set(document.uri, diagnostics);
-                    vscode.window.showInformationMessage(`Duplicate code found. Would you like to review it?`, 'Yes', 'No').then(async (choice) => {
-                        if (choice === 'Yes') {
-                            await reviewDuplicateCode(codeDuplicates, document);
-                        }
-                    });
-                }
-                else {
-                    // Extract all if statements from the document
-                    const ifStatements = extractIfStatements(document);
-                    // Find duplicate if statements
-                    const ifDuplicates = findDuplicateIfStatements(ifStatements);
-                    if (ifDuplicates.length > 0) {
-                        // Add diagnostics for duplicate if statements
-                        ifDuplicates.forEach((dup) => {
-                            diagnostics.push(new vscode_1.Diagnostic(dup.range, `Duplicate if statement found. Similar if statement exists at line ${dup.matchRange.start.line + 1}`, vscode.DiagnosticSeverity.Warning));
-                        });
-                        // Update diagnostics
-                        diagnosticCollection.set(document.uri, diagnostics);
-                        // Start the interactive process to review each duplicate if statement
-                        await reviewDuplicateIfStatements(ifDuplicates, document);
-                    }
-                    else {
-                        vscode.window.showInformationMessage('No duplicate code found in the current file.');
-                    }
-                }
+                vscode.window.showInformationMessage('No duplicate functions, code, or if statements found in the current file.');
             }
         }
         catch (error) {
@@ -98,12 +173,10 @@ function activate(context) {
             console.error('Duplicate detection error:', error);
         }
     });
-    // Register a command to extract duplicates to a function
     let extractDuplicatesCommand = vscode.commands.registerCommand('extension.extractDuplicates', async (document, diagnostics) => {
         if (!document || !diagnostics || diagnostics.length === 0)
             return;
         try {
-            // Check if the diagnostic is for a duplicate function or code
             const functionDuplicates = [];
             const codeDuplicates = [];
             for (const diag of diagnostics) {
@@ -112,22 +185,21 @@ function activate(context) {
                 const lineMatch = message.match(/line (\d+)/i);
                 if (lineMatch) {
                     const matchLine = parseInt(lineMatch[1]) - 1;
+                    const matchRange = new vscode_1.Range(new vscode_1.Position(matchLine, 0), new vscode_1.Position(matchLine + (diag.range.end.line - diag.range.start.line), 0));
                     if (isFunctionDuplicate) {
-                        // Extract function name from message
                         const nameMatch = message.match(/function '([^']+)'/i);
                         const matchName = nameMatch ? nameMatch[1] : 'unknown';
                         functionDuplicates.push({
                             name: '',
                             range: diag.range,
                             matchName,
-                            matchRange: new vscode_1.Range(new vscode_1.Position(matchLine, 0), new vscode_1.Position(matchLine + 10, 0) // Approximate
-                            )
+                            matchRange
                         });
                     }
                     else {
                         codeDuplicates.push({
                             range: diag.range,
-                            matchRange: new vscode_1.Range(new vscode_1.Position(matchLine, 0), new vscode_1.Position(matchLine + (diag.range.end.line - diag.range.start.line), 0))
+                            matchRange
                         });
                     }
                 }
@@ -135,7 +207,7 @@ function activate(context) {
             if (functionDuplicates.length > 0) {
                 await reviewDuplicateFunctions(functionDuplicates, document);
             }
-            else if (codeDuplicates.length > 0) {
+            if (codeDuplicates.length > 0) {
                 await reviewDuplicateCode(codeDuplicates, document);
             }
         }
@@ -144,7 +216,6 @@ function activate(context) {
             console.error('Error extracting duplicates:', error);
         }
     });
-    // Register a code action provider
     const codeActionProvider = vscode.languages.registerCodeActionsProvider({
         scheme: 'file',
         language: '*',
@@ -173,100 +244,117 @@ function deactivate() {
     diagnosticCollection.dispose();
 }
 exports.deactivate = deactivate;
-// Extract all functions from the document
+const phpEngine = new php_parser_1.default.Engine({
+    parser: { php7: true },
+    ast: { withPositions: true }
+});
+function isPHPFile(filePath) {
+    return filePath.endsWith('.php');
+}
+function isJSOrTSFile(filePath) {
+    return filePath.endsWith('.js') || filePath.endsWith('.ts');
+}
 function extractFunctions(document) {
     const text = document.getText();
     const functions = [];
-    // Regular expression to find function declarations
-    // This will match both named functions and arrow functions
-    const functionRegex = /(?:function\s+([\w$]+)\s*\(([^)]*)\)|(?:const|let|var)\s+([\w$]+)\s*=\s*(?:function\s*\(([^)]*)\)|\(([^)]*)\)\s*=>))\s*{([^}]*)}/g;
-    let match;
-    while ((match = functionRegex.exec(text)) !== null) {
-        // Extract function name and body
-        const name = match[1] || match[3] || 'anonymous';
-        const params = match[2] || match[4] || match[5] || '';
-        const body = match[6] || '';
-        // Get the range of the function
-        const startPos = document.positionAt(match.index);
-        const endPos = document.positionAt(match.index + match[0].length);
-        const range = new vscode_1.Range(startPos, endPos);
-        // Normalize the body to compare functions regardless of variable names
-        const normalizedBody = normalizeCode(body);
-        // Convert params string to array
-        const paramsArray = params.split(',').map(p => p.trim()).filter(p => p.length > 0);
-        functions.push({
-            name,
-            range,
-            body,
-            normalizedBody,
-            params: paramsArray
+    if (text.includes('<?php')) {
+        // PHP parsing
+        const ast = phpEngine.parseCode(text, "unknown.php");
+        const walk = (node) => {
+            if (!node)
+                return;
+            if (Array.isArray(node)) {
+                node.forEach(walk);
+            }
+            else if (node.kind === 'function') {
+                const name = node.name.name || 'anonymous';
+                const params = node.arguments.map((p) => p.name);
+                const body = text.slice(node.body.loc.start.offset, node.body.loc.end.offset);
+                const normalizedBody = normalizeCode(body);
+                const startPos = document.positionAt(node.loc.start.offset);
+                const endPos = document.positionAt(node.loc.end.offset);
+                const range = new vscode_1.Range(startPos, endPos);
+                functions.push({ name, range, body, normalizedBody, params });
+            }
+            for (const key in node) {
+                if (typeof node[key] === 'object')
+                    walk(node[key]);
+            }
+        };
+        walk(ast);
+    }
+    else {
+        // JS/TS parsing
+        const ast = acorn.parse(text, { ecmaVersion: "latest", sourceType: "module" });
+        (0, acorn_walk_1.simple)(ast, {
+            FunctionDeclaration(node) {
+                var _a;
+                const name = ((_a = node.id) === null || _a === void 0 ? void 0 : _a.name) || "anonymous";
+                const params = node.params.map((p) => text.slice(p.start, p.end));
+                const body = text.slice(node.body.start + 1, node.body.end - 1);
+                const normalizedBody = normalizeCode(body);
+                const range = new vscode_1.Range(document.positionAt(node.start), document.positionAt(node.end));
+                functions.push({ name, range, body, normalizedBody, params });
+            },
+            VariableDeclaration(node) {
+                for (const decl of node.declarations) {
+                    const init = decl.init;
+                    if (init &&
+                        (init.type === "FunctionExpression" || init.type === "ArrowFunctionExpression")) {
+                        const name = decl.id.name || "anonymous";
+                        const params = init.params.map((p) => text.slice(p.start, p.end));
+                        const body = init.body.type === "BlockStatement"
+                            ? text.slice(init.body.start + 1, init.body.end - 1)
+                            : text.slice(init.body.start, init.body.end);
+                        const normalizedBody = normalizeCode(body);
+                        const range = new vscode_1.Range(document.positionAt(init.start), document.positionAt(init.end));
+                        functions.push({ name, range, body, normalizedBody, params });
+                    }
+                }
+            }
         });
     }
     return functions;
 }
-// Extract all if statements from the document
 function extractIfStatements(document) {
     const text = document.getText();
     const ifStatements = [];
-    // Regular expressions to find if statements in different formats
-    // This will match standard if statements with their conditions and bodies
-    const standardIfRegex = /if\s*\(([^)]*)\)\s*{([^}]*)}/g;
-    // This will match PHP-style if statements that might have else blocks
-    const phpStyleIfRegex = /if\s*\(([^)]*)\)\s*{([\s\S]*?)(?:}\s*else\s*{|$)/g;
-    // Process standard if statements
-    let match;
-    while ((match = standardIfRegex.exec(text)) !== null) {
-        // Extract condition and body
-        const condition = match[1] || '';
-        const body = match[2] || '';
-        // Skip empty or trivial if statements
-        if (body.trim().length < 10)
-            continue;
-        // Get the range of the if statement
-        const startPos = document.positionAt(match.index);
-        const endPos = document.positionAt(match.index + match[0].length);
-        const range = new vscode_1.Range(startPos, endPos);
-        // Normalize the body to compare if statements regardless of variable names
-        const normalizedBody = normalizeCodeForComparison(body);
-        ifStatements.push({
-            condition,
-            range,
-            body,
-            normalizedBody
-        });
+    if (text.includes('<?php')) {
+        const ast = phpEngine.parseCode(text, "unknown.php");
+        const walk = (node) => {
+            if (!node)
+                return;
+            if (Array.isArray(node)) {
+                node.forEach(walk);
+            }
+            else if (node.kind === 'if') {
+                const condition = text.slice(node.test.loc.start.offset, node.test.loc.end.offset);
+                const body = node.body ? text.slice(node.body.loc.start.offset, node.body.loc.end.offset) : '';
+                if (body.trim().length < 10)
+                    return;
+                const range = new vscode_1.Range(document.positionAt(node.loc.start.offset), document.positionAt(node.loc.end.offset));
+                const normalizedBody = normalizeCodeForComparison(body);
+                ifStatements.push({ condition, range, body, normalizedBody });
+            }
+            for (const key in node) {
+                if (typeof node[key] === 'object')
+                    walk(node[key]);
+            }
+        };
+        walk(ast);
     }
-    // Process PHP-style if statements
-    let phpMatch;
-    while ((phpMatch = phpStyleIfRegex.exec(text)) !== null) {
-        // Extract condition and body
-        const condition = phpMatch[1] || '';
-        let body = phpMatch[2] || '';
-        // If the body contains the closing bracket of the if, trim it
-        const closingBracketIndex = body.lastIndexOf('}');
-        if (closingBracketIndex !== -1) {
-            body = body.substring(0, closingBracketIndex);
-        }
-        // Skip empty or trivial if statements or ones we've already processed
-        if (body.trim().length < 10)
-            continue;
-        // Check if this if statement is already in our list
-        const phpMatchIndex = phpMatch.index; // Store index in a local variable
-        const isDuplicate = ifStatements.some(stmt => {
-            return Math.abs(document.positionAt(phpMatchIndex).line - stmt.range.start.line) < 5;
-        });
-        if (isDuplicate)
-            continue;
-        // Get the range of the if statement
-        const startPos = document.positionAt(phpMatch.index);
-        const endPos = document.positionAt(phpMatch.index + phpMatch[0].length);
-        const range = new vscode_1.Range(startPos, endPos);
-        // Normalize the body to compare if statements regardless of variable names
-        const normalizedBody = normalizeCodeForComparison(body);
-        ifStatements.push({
-            condition,
-            range,
-            body,
-            normalizedBody
+    else {
+        const ast = acorn.parse(text, { ecmaVersion: "latest", sourceType: "module" });
+        (0, acorn_walk_1.simple)(ast, {
+            IfStatement(node) {
+                const condition = text.slice(node.test.start, node.test.end);
+                const body = text.slice(node.consequent.start, node.consequent.end);
+                if (body.trim().length < 10)
+                    return;
+                const range = new vscode_1.Range(document.positionAt(node.start), document.positionAt(node.end));
+                const normalizedBody = normalizeCodeForComparison(body);
+                ifStatements.push({ condition, range, body, normalizedBody });
+            }
         });
     }
     return ifStatements;
@@ -286,7 +374,7 @@ function findDuplicateFunctions(functions) {
             const similarity = calculateSimilarity(func1.normalizedBody, func2.normalizedBody);
             // If the similarity is high enough, consider them duplicates
             // Always mark the second function (func2) as the duplicate to be removed
-            if (similarity > 0.9) { // 90% similarity threshold for functions
+            if (similarity > 0.95) { // 90% similarity threshold for functions
                 duplicates.push({
                     name: func1.name,
                     range: func1.range,
@@ -324,6 +412,15 @@ function findDuplicateIfStatements(ifStatements) {
 }
 // Keep track of processed duplicates to avoid showing the same duplicate twice
 let processedDuplicates = [];
+// Function to clear processed duplicates for a specific type
+function clearProcessedDuplicates(type) {
+    if (type) {
+        processedDuplicates = processedDuplicates.filter(d => d.type !== type);
+    }
+    else {
+        processedDuplicates = [];
+    }
+}
 // Find the next duplicate code block in the document
 function findNextCodeDuplicate(document) {
     const duplicates = [];
@@ -354,7 +451,8 @@ function findNextCodeDuplicate(document) {
                     start: chunk1.range.start.line,
                     end: chunk1.range.end.line,
                     matchStart: chunk2.range.start.line,
-                    matchEnd: chunk2.range.end.line
+                    matchEnd: chunk2.range.end.line,
+                    type: 'code' // Add the type for code duplicates
                 });
                 duplicates.push({
                     range: chunk1.range,
@@ -367,43 +465,15 @@ function findNextCodeDuplicate(document) {
     }
     return duplicates;
 }
-// Find all duplicate code blocks in the document (used for diagnostics)
-function findCodeDuplicates(document) {
-    const duplicates = [];
-    const chunks = extractCodeChunks(document);
-    // Compare each chunk with every other chunk
-    for (let i = 0; i < chunks.length; i++) {
-        for (let j = i + 1; j < chunks.length; j++) {
-            const chunk1 = chunks[i];
-            const chunk2 = chunks[j];
-            // Skip if the ranges overlap
-            if (rangesOverlap(chunk1.range, chunk2.range))
-                continue;
-            // Normalize the code for comparison
-            const normalized1 = normalizeCodeForComparison(chunk1.code);
-            const normalized2 = normalizeCodeForComparison(chunk2.code);
-            // Skip if the normalized code is too short
-            if (normalized1.length < 30 || normalized2.length < 30)
-                continue;
-            // Calculate similarity
-            const similarity = calculateSimilarity(normalized1, normalized2);
-            // If the similarity is high enough, consider them duplicates
-            if (similarity > 0.85) { // 85% similarity threshold for code blocks
-                duplicates.push({
-                    range: chunk1.range,
-                    matchRange: chunk2.range
-                });
-            }
-        }
-    }
-    return duplicates;
-}
 // Check if a duplicate has already been processed
-function isDuplicateProcessed(range1, range2) {
-    return processedDuplicates.some(pd => (pd.start === range1.start.line && pd.end === range1.end.line &&
-        pd.matchStart === range2.start.line && pd.matchEnd === range2.end.line) ||
-        (pd.start === range2.start.line && pd.end === range2.end.line &&
-            pd.matchStart === range1.start.line && pd.matchEnd === range1.end.line));
+function isDuplicateProcessed(range1, range2, type) {
+    const duplicatesToCheck = type
+        ? processedDuplicates.filter(d => d.type === type)
+        : processedDuplicates;
+    return duplicatesToCheck.some(d => (d.start === range1.start.line && d.end === range1.end.line &&
+        d.matchStart === range2.start.line && d.matchEnd === range2.end.line) ||
+        (d.start === range2.start.line && d.end === range2.end.line &&
+            d.matchStart === range1.start.line && d.matchEnd === range1.end.line));
 }
 // Review each duplicate function one by one
 async function reviewDuplicateFunctions(duplicates, document) {
@@ -958,87 +1028,6 @@ function hasCodeStructure(code) {
     // Code should have some complexity to be worth extracting
     return (lineCount >= 3) && (hasControlStructure || hasFunctionCall || (hasAssignment && hasReturn));
 }
-function findDuplicates(chunks) {
-    const duplicates = [];
-    const seen = new Map();
-    // First, identify function chunks for special handling
-    const functionChunks = [];
-    const regularChunks = [];
-    for (const chunk of chunks) {
-        // Check if this chunk contains a complete function
-        const functionMatch = chunk.code.match(/function\s+([\w_]+)\s*\([^)]*\)\s*{[\s\S]*}/i);
-        if (functionMatch) {
-            // This is a function, normalize its body for comparison
-            const normalizedBody = normalizeCode(chunk.code);
-            functionChunks.push({ ...chunk, normalizedBody });
-        }
-        else {
-            regularChunks.push(chunk);
-        }
-    }
-    // First pass: compare functions with each other (special handling for duplicate functions)
-    for (let i = 0; i < functionChunks.length; i++) {
-        const chunk = functionChunks[i];
-        // Skip if this function has already been matched
-        if (duplicates.some(d => rangesEqual(d.range, chunk.range)))
-            continue;
-        for (let j = i + 1; j < functionChunks.length; j++) {
-            const otherChunk = functionChunks[j];
-            // Skip if already matched
-            if (duplicates.some(d => rangesEqual(d.range, otherChunk.range)))
-                continue;
-            // Compare function bodies
-            const similarity = calculateSimilarity(chunk.normalizedBody, otherChunk.normalizedBody);
-            if (similarity > 0.9) { // Higher threshold for functions (90%)
-                duplicates.push({
-                    range: chunk.range,
-                    matchRange: otherChunk.range
-                });
-                break; // Found a match for this function
-            }
-        }
-    }
-    // Second pass: process regular chunks
-    for (let i = 0; i < regularChunks.length; i++) {
-        const chunk = regularChunks[i];
-        // Skip if this chunk has already been matched
-        if (duplicates.some(d => rangesEqual(d.range, chunk.range)))
-            continue;
-        // Skip short chunks (likely not meaningful duplicates)
-        if (chunk.code.length < 50)
-            continue;
-        // Normalize the code for better comparison
-        const normalizedCode = normalizeCode(chunk.code);
-        // Skip if normalized code is too short
-        if (normalizedCode.length < 30)
-            continue;
-        // Calculate a similarity score for fuzzy matching
-        let bestMatch = null;
-        let highestSimilarity = 0;
-        // Check for similar code (not just exact matches)
-        for (const [key, value] of seen.entries()) {
-            // Skip if ranges overlap
-            if (rangesOverlap(chunk.range, value.range))
-                continue;
-            const similarity = calculateSimilarity(normalizedCode, key);
-            if (similarity > 0.85 && similarity > highestSimilarity) { // 85% similarity threshold
-                highestSimilarity = similarity;
-                bestMatch = value;
-            }
-        }
-        if (bestMatch) {
-            duplicates.push({
-                range: chunk.range,
-                matchRange: bestMatch.range
-            });
-        }
-        else {
-            seen.set(normalizedCode, chunk);
-        }
-    }
-    // Filter out duplicates that are subsets of other duplicates
-    return filterSubsetDuplicates(duplicates);
-}
 // Helper to normalize code for comparison
 function normalizeCode(code) {
     // Special handling for function bodies - extract just the function body for better comparison
@@ -1085,73 +1074,184 @@ function normalizeCodeContent(code) {
         .replace(/\b\d+\b/g, '__NUM__')
         .trim();
 }
-// Helper to calculate similarity between two strings
-function calculateSimilarity(str1, str2) {
-    // Simple implementation of Levenshtein distance for string similarity
-    const len1 = str1.length;
-    const len2 = str2.length;
-    // If the strings are too different in length, they're probably not similar
-    if (Math.abs(len1 - len2) > Math.min(len1, len2) * 0.3) {
+// Enhanced similarity calculation that runs all algorithms and returns their average score
+function calculateSimilarity(str1, str2, options = {}) {
+    // Handle edge cases
+    if (!str1 && !str2)
+        return 1;
+    if (!str1 || !str2)
+        return 0;
+    if (str1 === str2)
+        return 1;
+    const { caseSensitive = false, ignoreWhitespace = true, minLength = 3, lengthPenalty = 0.3 } = options;
+    // Normalize strings based on options
+    let normalized1 = caseSensitive ? str1 : str1.toLowerCase();
+    let normalized2 = caseSensitive ? str2 : str2.toLowerCase();
+    if (ignoreWhitespace) {
+        normalized1 = normalized1.replace(/\s+/g, ' ').trim();
+        normalized2 = normalized2.replace(/\s+/g, ' ').trim();
+    }
+    // Quick exit for very short strings
+    if (normalized1.length < minLength && normalized2.length < minLength) {
+        return normalized1 === normalized2 ? 1 : 0;
+    }
+    // Length difference check with configurable penalty
+    const len1 = normalized1.length;
+    const len2 = normalized2.length;
+    const lengthDiff = Math.abs(len1 - len2);
+    const minLen = Math.min(len1, len2);
+    if (lengthDiff > minLen * lengthPenalty) {
         return 0;
     }
-    const dp = Array(len1 + 1)
-        .fill(null)
-        .map(() => Array(len2 + 1).fill(0));
-    for (let i = 0; i <= len1; i++)
-        dp[i][0] = i;
-    for (let j = 0; j <= len2; j++)
-        dp[0][j] = j;
+    // Run all similarity algorithms
+    const similarities = [
+        calculateLevenshteinSimilarity(normalized1, normalized2),
+        calculateJaroSimilarity(normalized1, normalized2),
+        calculateJaroWinklerSimilarity(normalized1, normalized2),
+        calculateLCSSimilarity(normalized1, normalized2),
+        calculateNGramSimilarity(normalized1, normalized2, 2)
+    ];
+    // Calculate the average similarity score
+    const sum = similarities.reduce((acc, score) => acc + score, 0);
+    const average = sum / similarities.length;
+    return average;
+}
+// Optimized Levenshtein distance with early termination
+function calculateLevenshteinSimilarity(str1, str2) {
+    const len1 = str1.length;
+    const len2 = str2.length;
+    // Use single array instead of 2D matrix for memory optimization
+    let prev = Array(len2 + 1).fill(0).map((_, i) => i);
+    let curr = Array(len2 + 1).fill(0);
     for (let i = 1; i <= len1; i++) {
+        curr[0] = i;
+        let minInRow = i;
         for (let j = 1; j <= len2; j++) {
             const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-            dp[i][j] = Math.min(dp[i - 1][j] + 1, // deletion
-            dp[i][j - 1] + 1, // insertion
-            dp[i - 1][j - 1] + cost // substitution
+            curr[j] = Math.min(prev[j] + 1, // deletion
+            curr[j - 1] + 1, // insertion
+            prev[j - 1] + cost // substitution
             );
+            minInRow = Math.min(minInRow, curr[j]);
+        }
+        // Early termination if minimum distance in row is too high
+        const maxAllowedDistance = Math.max(len1, len2) * 0.5;
+        if (minInRow > maxAllowedDistance) {
+            return 0;
+        }
+        // Swap arrays
+        [prev, curr] = [curr, prev];
+    }
+    const maxLen = Math.max(len1, len2);
+    return maxLen === 0 ? 1 : 1 - prev[len2] / maxLen;
+}
+// Jaro similarity algorithm
+function calculateJaroSimilarity(str1, str2) {
+    const len1 = str1.length;
+    const len2 = str2.length;
+    if (len1 === 0 && len2 === 0)
+        return 1;
+    if (len1 === 0 || len2 === 0)
+        return 0;
+    const matchWindow = Math.floor(Math.max(len1, len2) / 2) - 1;
+    if (matchWindow < 1)
+        return str1 === str2 ? 1 : 0;
+    const str1Matches = new Array(len1).fill(false);
+    const str2Matches = new Array(len2).fill(false);
+    let matches = 0;
+    // Find matches
+    for (let i = 0; i < len1; i++) {
+        const start = Math.max(0, i - matchWindow);
+        const end = Math.min(i + matchWindow + 1, len2);
+        for (let j = start; j < end; j++) {
+            if (str2Matches[j] || str1[i] !== str2[j])
+                continue;
+            str1Matches[i] = true;
+            str2Matches[j] = true;
+            matches++;
+            break;
         }
     }
-    // Convert distance to similarity score (0 to 1)
+    if (matches === 0)
+        return 0;
+    // Count transpositions
+    let transpositions = 0;
+    let k = 0;
+    for (let i = 0; i < len1; i++) {
+        if (!str1Matches[i])
+            continue;
+        while (!str2Matches[k])
+            k++;
+        if (str1[i] !== str2[k])
+            transpositions++;
+        k++;
+    }
+    return (matches / len1 + matches / len2 + (matches - transpositions / 2) / matches) / 3;
+}
+// Jaro-Winkler similarity (Jaro with prefix bonus)
+function calculateJaroWinklerSimilarity(str1, str2, prefixScale = 0.1) {
+    const jaroSim = calculateJaroSimilarity(str1, str2);
+    if (jaroSim < 0.7)
+        return jaroSim;
+    // Calculate common prefix length (up to 4 characters)
+    let prefixLength = 0;
+    const maxPrefix = Math.min(4, Math.min(str1.length, str2.length));
+    for (let i = 0; i < maxPrefix; i++) {
+        if (str1[i] === str2[i]) {
+            prefixLength++;
+        }
+        else {
+            break;
+        }
+    }
+    return jaroSim + (prefixLength * prefixScale * (1 - jaroSim));
+}
+// Longest Common Subsequence similarity
+function calculateLCSSimilarity(str1, str2) {
+    const len1 = str1.length;
+    const len2 = str2.length;
+    // Use space-optimized LCS
+    let prev = new Array(len2 + 1).fill(0);
+    let curr = new Array(len2 + 1).fill(0);
+    for (let i = 1; i <= len1; i++) {
+        for (let j = 1; j <= len2; j++) {
+            if (str1[i - 1] === str2[j - 1]) {
+                curr[j] = prev[j - 1] + 1;
+            }
+            else {
+                curr[j] = Math.max(prev[j], curr[j - 1]);
+            }
+        }
+        [prev, curr] = [curr, prev];
+    }
+    const lcsLength = prev[len2];
     const maxLen = Math.max(len1, len2);
-    return maxLen === 0 ? 1 : 1 - dp[len1][len2] / maxLen;
+    return maxLen === 0 ? 1 : lcsLength / maxLen;
+}
+// N-gram similarity
+function calculateNGramSimilarity(str1, str2, n = 2) {
+    const ngrams1 = getNGrams(str1, n);
+    const ngrams2 = getNGrams(str2, n);
+    if (ngrams1.size === 0 && ngrams2.size === 0)
+        return 1;
+    if (ngrams1.size === 0 || ngrams2.size === 0)
+        return 0;
+    const intersection = new Set([...ngrams1].filter(x => ngrams2.has(x)));
+    const union = new Set([...ngrams1, ...ngrams2]);
+    return intersection.size / union.size;
+}
+function getNGrams(str, n) {
+    const ngrams = new Set();
+    const paddedStr = ' '.repeat(n - 1) + str + ' '.repeat(n - 1);
+    for (let i = 0; i <= paddedStr.length - n; i++) {
+        ngrams.add(paddedStr.substring(i, i + n));
+    }
+    return ngrams;
 }
 // Helper to check if two ranges overlap
 function rangesOverlap(range1, range2) {
     return ((range1.start.line <= range2.end.line && range1.end.line >= range2.start.line) ||
         (range2.start.line <= range1.end.line && range2.end.line >= range1.start.line));
-}
-// Helper to check if two ranges are equal
-function rangesEqual(range1, range2) {
-    return (range1.start.line === range2.start.line &&
-        range1.start.character === range2.start.character &&
-        range1.end.line === range2.end.line &&
-        range1.end.character === range2.end.character);
-}
-// Helper to filter out duplicates that are subsets of other duplicates
-function filterSubsetDuplicates(duplicates) {
-    const result = [];
-    for (let i = 0; i < duplicates.length; i++) {
-        let isSubset = false;
-        const current = duplicates[i];
-        for (let j = 0; j < duplicates.length; j++) {
-            if (i === j)
-                continue;
-            const other = duplicates[j];
-            if (isRangeSubset(current.range, other.range) &&
-                isRangeSubset(current.matchRange, other.matchRange)) {
-                isSubset = true;
-                break;
-            }
-        }
-        if (!isSubset) {
-            result.push(current);
-        }
-    }
-    return result;
-}
-// Helper to check if one range is a subset of another
-function isRangeSubset(range1, range2) {
-    return ((range1.start.line >= range2.start.line && range1.end.line <= range2.end.line) ||
-        (range1.start.line <= range2.start.line && range1.end.line >= range2.end.line));
 }
 // Helper to generate a meaningful function name based on the content
 function generateFunctionName(code) {
@@ -1168,6 +1268,32 @@ function generateFunctionName(code) {
     // Fallback to a generic name with random number
     return `extractedFunction${Math.floor(Math.random() * 1000)}`;
 }
-// Helper to determine if code is worth extracting to a function
-function isWorthExtracting(code, document) {
-    // Special case: If this is a complete function, it's always worth extrac
+// Helper to extract potential parameters from the code
+function extractPotentialParameters(code) {
+    // Find variables that are used but not declared in the code block
+    const declarations = new Set();
+    const usages = new Set();
+    // Extract variable declarations
+    const declarationMatches = code.match(/\b(const|let|var)\s+([\w_]+)\b/g) || [];
+    for (const match of declarationMatches) {
+        const varName = match.split(/\s+/)[1];
+        declarations.add(varName);
+    }
+    // Extract variable usages (simplified approach)
+    const usageRegex = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b(?!\s*[({:])/g;
+    let match;
+    while ((match = usageRegex.exec(code)) !== null) {
+        const varName = match[1];
+        // Skip keywords and common built-ins
+        if (!['if', 'else', 'for', 'while', 'function', 'return', 'const', 'let', 'var',
+            'true', 'false', 'null', 'undefined', 'this', 'console'].includes(varName)) {
+            usages.add(varName);
+        }
+    }
+    // Find variables used but not declared (potential parameters)
+    const potentialParams = Array.from(usages).filter(usage => !declarations.has(usage));
+    // Create parameter list
+    const paramList = potentialParams.join(', ');
+    return { paramList, modifiedCode: code };
+}
+//# sourceMappingURL=extension.js.map
