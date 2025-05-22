@@ -1,0 +1,35 @@
+import execa from 'execa';
+import which from 'which';
+import { existsSync } from 'fs';
+const convertStringToObject = (sourceLine) => {
+    const matches = sourceLine.match(/(.+)\s+\((.+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (\+|\-)\d{4})\s+(\d+)\)(.*)/);
+    const [, rev, author, date, , line] = matches
+        ? [...matches]
+        : [null, '', '', '', '', ''];
+    return {
+        author,
+        date,
+        line,
+        rev
+    };
+};
+export async function git(path) {
+    const blamedLines = {};
+    const pathToGit = await which('git');
+    if (!existsSync(path)) {
+        throw new Error(`File ${path} does not exist`);
+    }
+    const result = execa.sync(pathToGit, ['blame', '-w', path]);
+    result.stdout.split('\n').forEach(line => {
+        if (line !== '') {
+            const blamedLine = convertStringToObject(line);
+            if (blamedLine.line) {
+                blamedLines[blamedLine.line] = blamedLine;
+            }
+        }
+    });
+    return {
+        [path]: blamedLines
+    };
+}
+//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozLCJmaWxlIjoiZ2l0LmpzIiwic291cmNlUm9vdCI6IiIsInNvdXJjZXMiOlsiLi4vLi4vLi4vc3JjL3Zjcy9naXQudHMiXSwibmFtZXMiOltdLCJtYXBwaW5ncyI6IkFBQUEsT0FBTyxLQUFLLE1BQU0sT0FBTyxDQUFDO0FBQzFCLE9BQU8sS0FBSyxNQUFNLE9BQU8sQ0FBQztBQUUxQixPQUFPLEVBQUUsVUFBVSxFQUFFLE1BQU0sSUFBSSxDQUFDO0FBRWhDLE1BQU0scUJBQXFCLEdBQUcsQ0FBQyxVQUFrQixFQUFjLEVBQUU7SUFDL0QsTUFBTSxPQUFPLEdBQUcsVUFBVSxDQUFDLEtBQUssQ0FDOUIsa0ZBQWtGLENBQ25GLENBQUM7SUFDRixNQUFNLENBQUMsRUFBRSxHQUFHLEVBQUUsTUFBTSxFQUFFLElBQUksRUFBRSxBQUFELEVBQUcsSUFBSSxDQUFDLEdBQUcsT0FBTztRQUMzQyxDQUFDLENBQUMsQ0FBQyxHQUFHLE9BQU8sQ0FBQztRQUNkLENBQUMsQ0FBQyxDQUFDLElBQUksRUFBRSxFQUFFLEVBQUUsRUFBRSxFQUFFLEVBQUUsRUFBRSxFQUFFLEVBQUUsRUFBRSxDQUFDLENBQUM7SUFDL0IsT0FBTztRQUNMLE1BQU07UUFDTixJQUFJO1FBQ0osSUFBSTtRQUNKLEdBQUc7S0FDSixDQUFDO0FBQ0osQ0FBQyxDQUFDO0FBRUYsTUFBTSxDQUFDLEtBQUssVUFBVSxHQUFHLENBQUMsSUFBWTtJQUNwQyxNQUFNLFdBQVcsR0FBbUMsRUFBRSxDQUFDO0lBQ3ZELE1BQU0sU0FBUyxHQUFXLE1BQU0sS0FBSyxDQUFDLEtBQUssQ0FBQyxDQUFDO0lBRTdDLElBQUksQ0FBQyxVQUFVLENBQUMsSUFBSSxDQUFDLEVBQUU7UUFDckIsTUFBTSxJQUFJLEtBQUssQ0FBQyxRQUFRLElBQUksaUJBQWlCLENBQUMsQ0FBQztLQUNoRDtJQUVELE1BQU0sTUFBTSxHQUFHLEtBQUssQ0FBQyxJQUFJLENBQUMsU0FBUyxFQUFFLENBQUMsT0FBTyxFQUFFLElBQUksRUFBRSxJQUFJLENBQUMsQ0FBQyxDQUFDO0lBQzVELE1BQU0sQ0FBQyxNQUFNLENBQUMsS0FBSyxDQUFDLElBQUksQ0FBQyxDQUFDLE9BQU8sQ0FBQyxJQUFJLENBQUMsRUFBRTtRQUN2QyxJQUFJLElBQUksS0FBSyxFQUFFLEVBQUU7WUFDZixNQUFNLFVBQVUsR0FBRyxxQkFBcUIsQ0FBQyxJQUFJLENBQUMsQ0FBQztZQUMvQyxJQUFJLFVBQVUsQ0FBQyxJQUFJLEVBQUU7Z0JBQ25CLFdBQVcsQ0FBQyxVQUFVLENBQUMsSUFBSSxDQUFDLEdBQUcsVUFBVSxDQUFDO2FBQzNDO1NBQ0Y7SUFDSCxDQUFDLENBQUMsQ0FBQztJQUNILE9BQU87UUFDTCxDQUFDLElBQUksQ0FBQyxFQUFFLFdBQVc7S0FDcEIsQ0FBQztBQUNKLENBQUMifQ==
